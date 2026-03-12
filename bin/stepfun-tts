@@ -1,0 +1,116 @@
+#!/usr/bin/env node
+
+/**
+ * StepFun TTS Provider Handler for OpenClaw
+ *
+ * Wraps StepFun's Step-TTS-2 speech API.
+ * Reads JSON from stdin, writes result JSON to stdout.
+ *
+ * Input:  { text: string, config?: { apiKey?, model?, voice? } }
+ * Output: { audioPath: string, format: string }
+ * Error:  exit(1) + stderr message
+ */
+
+const fs = require('fs');
+const path = require('path');
+const https = require('https');
+
+const defaults = {
+  apiKey: process.env.STEPFUN_API_KEY || '',
+  baseUrl: process.env.STEPFUN_BASE_URL || 'https://api.stepfun.com/v1',
+  model: process.env.STEPFUN_TTS_MODEL || 'step-tts-2',
+  voice: process.env.STEPFUN_TTS_VOICE || 'yuanqishaonv',
+  timeoutMs: parseInt(process.env.STEPFUN_TIMEOUT_MS || '30000', 10),
+};
+
+/**
+ * Generate audio from text via StepFun TTS API.
+ * @param {string} text - Text to synthesize
+ * @param {object} overrides - Optional config overrides
+ * @returns {Promise<{audioPath: string, format: string}>}
+ */
+function generateAudio(text, overrides = {}) {
+  return new Promise((resolve, reject) => {
+    const apiKey = overrides.apiKey || defaults.apiKey;
+    if (!apiKey) {
+      reject(new Error('STEPFUN_API_KEY not set. Export it or pass via config.apiKey'));
+      return;
+    }
+
+    const payload = JSON.stringify({
+      model: overrides.model || defaults.model,
+      voice: overrides.voice || defaults.voice,
+      input: text,
+    });
+
+    const baseUrl = overrides.baseUrl || defaults.baseUrl;
+    const url = new URL('/audio/speech', baseUrl);
+
+    const options = {
+      hostname: url.hostname,
+      port: url.port || 443,
+      path: url.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Length': Buffer.byteLength(payload),
+      },
+      timeout: overrides.timeoutMs || defaults.timeoutMs,
+    };
+
+    const req = https.request(options, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          const body = Buffer.concat(chunks).toString('utf8');
+          reject(new Error(`StepFun TTS HTTP ${res.statusCode}: ${body.slice(0, 500)}`));
+          return;
+        }
+
+        const outDir = process.env.OPENCLAW_TTS_OUT_DIR || '/tmp/openclaw/tts';
+        fs.mkdirSync(outDir, { recursive: true });
+
+        const ts = Date.now();
+        const rand = Math.random().toString(36).slice(2, 8);
+        const outPath = path.join(outDir, `stepfun-${ts}-${rand}.mp3`);
+
+        fs.writeFileSync(outPath, Buffer.concat(chunks));
+        resolve({ audioPath: outPath, format: 'mp3' });
+      });
+    });
+
+    req.on('error', (err) => reject(new Error(`StepFun TTS request failed: ${err.message}`)));
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('StepFun TTS request timed out'));
+    });
+
+    req.write(payload);
+    req.end();
+  });
+}
+
+// Main: read stdin JSON, produce output
+(async () => {
+  let raw = '';
+
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => (raw += chunk));
+  process.stdin.on('end', async () => {
+    try {
+      const input = JSON.parse(raw);
+      const text = input.text;
+      if (!text || typeof text !== 'string') {
+        throw new Error('Missing or invalid "text" field');
+      }
+
+      const result = await generateAudio(text, input.config || {});
+      process.stdout.write(JSON.stringify(result) + '\n');
+    } catch (err) {
+      process.stderr.write(err.message + '\n');
+      process.exit(1);
+    }
+  });
+})();

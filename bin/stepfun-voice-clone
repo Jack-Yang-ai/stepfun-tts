@@ -1,0 +1,203 @@
+#!/usr/bin/env node
+
+/**
+ * StepFun Voice Clone — 音色复刻工具
+ *
+ * 流程：
+ *   1. 上传音频文件 (5-10秒 mp3/wav) → file_id
+ *   2. 调用复刻 API → voice_id + 试听音频
+ *
+ * Usage:
+ *   node bin/stepfun-voice-clone --file ./sample.mp3 [--text "对应文本"] [--sample "试听文本"] [--model step-tts-2]
+ *
+ * Or via stdin JSON:
+ *   echo '{"file":"./sample.mp3","text":"...","sampleText":"..."}' | node bin/stepfun-voice-clone
+ *
+ * Output:
+ *   { voiceId, sampleAudioPath?, duplicated }
+ */
+
+const fs = require('fs');
+const path = require('path');
+const https = require('https');
+const http = require('http');
+
+const API_KEY = process.env.STEPFUN_API_KEY || '';
+const BASE_URL = (process.env.STEPFUN_BASE_URL || 'https://api.stepfun.com/v1').replace(/\/+$/, '');
+
+// ─── HTTP helpers ───────────────────────────────────────────────
+function request(url, options, body) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const mod = u.protocol === 'https:' ? https : http;
+    const req = mod.request({
+      hostname: u.hostname,
+      port: u.port || (u.protocol === 'https:' ? 443 : 80),
+      path: u.pathname + u.search,
+      ...options,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks) }));
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+// ─── Step 1: Upload audio file ──────────────────────────────────
+async function uploadFile(filePath, apiKey) {
+  const fileData = fs.readFileSync(filePath);
+  const fileName = path.basename(filePath);
+  const boundary = '----StepFun' + Math.random().toString(36).slice(2);
+
+  // Build multipart body with proper CRLF boundaries
+  const parts = [];
+  // purpose field
+  parts.push(Buffer.from(
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="purpose"\r\n\r\n` +
+    `storage\r\n`
+  ));
+  // file field header
+  parts.push(Buffer.from(
+    `--${boundary}\r\n` +
+    `Content-Disposition: form-data; name="file"; filename="${fileName}"\r\n` +
+    `Content-Type: application/octet-stream\r\n\r\n`
+  ));
+  // file data
+  parts.push(fileData);
+  // closing boundary
+  parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+
+  const body = Buffer.concat(parts);
+
+  const res = await request(`${BASE_URL}/files`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': `multipart/form-data; boundary=${boundary}`,
+      'Content-Length': body.length,
+    },
+    timeout: 60000,
+  }, body);
+
+  const data = JSON.parse(res.body.toString('utf8'));
+  if (res.status !== 200 || !data.id) {
+    throw new Error(`Upload failed (${res.status}): ${JSON.stringify(data)}`);
+  }
+  return data.id;
+}
+
+// ─── Step 2: Clone voice ────────────────────────────────────────
+async function cloneVoice(fileId, opts = {}) {
+  const apiKey = opts.apiKey || API_KEY;
+  const payload = {
+    file_id: fileId,
+    model: opts.model || process.env.STEPFUN_TTS_MODEL || 'step-tts-2',
+  };
+  if (opts.text) payload.text = opts.text;
+  if (opts.sampleText) payload.sample_text = opts.sampleText;
+
+  const body = JSON.stringify(payload);
+  const res = await request(`${BASE_URL}/audio/voices`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body),
+    },
+    timeout: 60000,
+  }, body);
+
+  const data = JSON.parse(res.body.toString('utf8'));
+  if (res.status !== 200 || !data.id) {
+    throw new Error(`Voice clone failed (${res.status}): ${JSON.stringify(data)}`);
+  }
+  return data;
+}
+
+// ─── Parse args ─────────────────────────────────────────────────
+function parseArgs() {
+  const args = process.argv.slice(2);
+  const opts = {};
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--file' && args[i + 1]) opts.file = args[++i];
+    else if (args[i] === '--text' && args[i + 1]) opts.text = args[++i];
+    else if (args[i] === '--sample' && args[i + 1]) opts.sampleText = args[++i];
+    else if (args[i] === '--model' && args[i + 1]) opts.model = args[++i];
+    else if (args[i] === '--api-key' && args[i + 1]) opts.apiKey = args[++i];
+    else if (!args[i].startsWith('-')) opts.file = opts.file || args[i];
+  }
+  return opts;
+}
+
+// ─── Main ───────────────────────────────────────────────────────
+(async () => {
+  try {
+    let opts;
+    const cliArgs = parseArgs();
+
+    if (cliArgs.file) {
+      opts = cliArgs;
+    } else {
+      // Read from stdin
+      let raw = '';
+      process.stdin.setEncoding('utf8');
+      await new Promise((resolve) => {
+        process.stdin.on('data', (c) => (raw += c));
+        process.stdin.on('end', resolve);
+      });
+      opts = JSON.parse(raw);
+    }
+
+    const apiKey = opts.apiKey || API_KEY;
+    if (!apiKey) throw new Error('STEPFUN_API_KEY not set');
+
+    const filePath = opts.file || opts.filePath;
+    if (!filePath) throw new Error('Missing audio file path. Use --file <path> or {"file":"path"}');
+    if (!fs.existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
+
+    // Check file size / duration hint
+    const stat = fs.statSync(filePath);
+    const ext = path.extname(filePath).toLowerCase();
+    if (!['.mp3', '.wav'].includes(ext)) {
+      throw new Error(`Unsupported format: ${ext}. Use .mp3 or .wav (5-10 seconds)`);
+    }
+
+    process.stderr.write(`Uploading ${path.basename(filePath)} (${(stat.size / 1024).toFixed(1)}KB)...\n`);
+
+    // Step 1: Upload
+    const fileId = await uploadFile(filePath, apiKey);
+    process.stderr.write(`Uploaded → file_id: ${fileId}\n`);
+
+    // Step 2: Clone
+    process.stderr.write(`Cloning voice...\n`);
+    const result = await cloneVoice(fileId, opts);
+
+    const output = {
+      voiceId: result.id,
+      duplicated: result.duplicated || false,
+    };
+
+    // Save sample audio if provided
+    if (result.sample_audio) {
+      const outDir = process.env.OPENCLAW_TTS_OUT_DIR || '/tmp/openclaw/tts';
+      fs.mkdirSync(outDir, { recursive: true });
+      const samplePath = path.join(outDir, `voice-sample-${result.id}.wav`);
+      fs.writeFileSync(samplePath, Buffer.from(result.sample_audio, 'base64'));
+      output.sampleAudioPath = samplePath;
+      output.sampleText = result.sample_text || '';
+      process.stderr.write(`Sample audio saved → ${samplePath}\n`);
+    }
+
+    process.stderr.write(`Done! Voice ID: ${result.id}\n`);
+    process.stdout.write(JSON.stringify(output) + '\n');
+
+  } catch (e) {
+    process.stderr.write(`Error: ${e.message}\n`);
+    process.exit(1);
+  }
+})();

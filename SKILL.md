@@ -109,7 +109,51 @@ echo '{"text":"你好"}' | STEPFUN_API_KEY=xxx node bin/stepfun-tts
 | `STEPFUN_TTS_FORMAT` | ❌ | `opus` | 输出格式 |
 | `STEPFUN_BASE_URL` | ❌ | `https://api.stepfun.com/v1` | API 地址 |
 
-## 音色
+## 音色复刻 🎙️
+
+用自己的声音（5-10秒 mp3/wav）复刻一个专属音色：
+
+```bash
+# CLI 方式
+node bin/stepfun-voice-clone --file ./my-voice.mp3 --text "音频对应的文本" --sample "试听文本"
+
+# stdin JSON 方式
+echo '{"file":"./my-voice.mp3","text":"对应文本","sampleText":"你好世界"}' | node bin/stepfun-voice-clone
+```
+
+输出：
+```json
+{"voiceId":"voice-abc123","duplicated":false,"sampleAudioPath":"/tmp/.../voice-sample-xxx.wav","sampleText":"你好世界"}
+```
+
+拿到 `voiceId` 后，设为默认音色：
+
+```bash
+export STEPFUN_TTS_VOICE="voice-abc123"
+```
+
+或在 `openclaw.json` 里改 `voice` 字段。
+
+### 复刻要求
+
+| 项目 | 要求 |
+|------|------|
+| 格式 | mp3 或 wav |
+| 时长 | 5-10 秒 |
+| 内容 | 清晰人声，少背景噪音 |
+| text | 建议传入对应文本（不传会用 ASR 自动识别） |
+
+### 复刻流程
+
+```
+音频文件 → 上传到 StepFun (purpose: storage) → file_id
+                                                  ↓
+file_id + model → POST /audio/voices → voice_id + 试听音频
+                                          ↓
+voice_id 用于 TTS 生成 (替代 yuanqishaonv 等预设音色)
+```
+
+## 预设音色
 
 | ID | 描述 |
 |----------|------|

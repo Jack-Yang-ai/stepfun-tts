@@ -1,7 +1,7 @@
 ---
 name: stepfun-tts
-description: StepFun Step-TTS-2 text-to-speech for OpenClaw. MP3 → Opus conversion + duration detection for Feishu voice bubbles.
-version: 0.2.0
+description: StepFun Step-TTS-2 TTS for OpenClaw + Feishu voice messages. One-stop solution.
+version: 0.3.0
 author: "marine"
 tags:
   - tts
@@ -16,71 +16,58 @@ metadata:
     os: ["darwin", "linux", "win32"]
     requires:
       env: ["STEPFUN_API_KEY"]
-      bin: ["ffmpeg", "ffprobe"]
+      bin: ["ffmpeg"]
 ---
 
 # StepFun TTS for OpenClaw
 
-Integrates [StepFun's Step-TTS-2](https://platform.stepfun.com/) text-to-speech API as an OpenClaw TTS provider.
-
-## Pipeline
+End-to-end text-to-speech for OpenClaw + 飞书语音气泡。
 
 ```
-Text → StepFun API → MP3 → ffmpeg → Opus → ffprobe → duration
-                                      ↓
-                              { audioPath, format: "opus", duration: 3 }
+Text → StepFun API → MP3 → ffmpeg → Opus + Duration
+                                       ↓
+                            OpenClaw gateway 自动发送飞书语音
+                                       or
+                            独立模式: 直接上传飞书 + 发语音消息
 ```
 
-**Why Opus?** 飞书语音消息要求 Opus 格式 + 时长（秒）。本 skill 自动完成转换。
+## 安装 3 步走
 
-## Features
-
-- 🇨🇳 High-quality Chinese TTS (multiple voices)
-- 🔄 Auto MP3→Opus conversion via ffmpeg
-- ⏱ Duration detection via ffprobe (integer seconds)
-- 📱 飞书语音气泡完整支持 (file_type=opus + duration)
-- 🔒 API key via environment variable
-- 📦 Zero npm dependencies (Node.js built-ins + system ffmpeg)
-
-## Quick Start
-
-### Prerequisites
+### Step 1: 安装 skill
 
 ```bash
-# macOS
-brew install ffmpeg
-
-# Ubuntu/Debian
-sudo apt install ffmpeg
-```
-
-### Install
-
-```bash
+# 方式 A: clawhub
 clawhub install stepfun-tts
-# or copy to ~/.openclaw/skills/stepfun-tts/
+
+# 方式 B: 手动
+git clone https://github.com/Jack-Yang-ai/stepfun-tts.git ~/.openclaw/skills/stepfun-tts
+chmod +x ~/.openclaw/skills/stepfun-tts/bin/stepfun-tts
 ```
 
-### Configure
+### Step 2: 配环境变量
 
 ```bash
-export STEPFUN_API_KEY="your-api-key"
+export STEPFUN_API_KEY="your-stepfun-api-key"     # 必填 - StepFun 平台获取
+export FFMPEG_PATH="/path/to/ffmpeg"               # 可选 - 如果 ffmpeg 不在 PATH 中
 ```
 
-Add to `~/.openclaw/openclaw.json`:
+### Step 3: 配 OpenClaw TTS
+
+编辑 `~/.openclaw/openclaw.json`:
 
 ```json5
 {
   "messages": {
     "tts": {
-      "auto": "always",
-      "provider": "openai",
+      "auto": "always",          // "always" | "off" | "short"
+      "provider": "openai",      // StepFun API 兼容 OpenAI 格式
       "openai": {
-        "apiKey": "${STEPFUN_API_KEY}",
+        "apiKey": "your-stepfun-api-key",
         "model": "step-tts-2",
-        "voice": "yuanqishaonv"
+        "voice": "yuanqishaonv",
+        "baseUrl": "https://api.stepfun.com/v1"
       },
-      "maxTextLength": 100
+      "maxTextLength": 100       // ≤100字自动转语音
     }
   }
 }
@@ -90,53 +77,106 @@ Add to `~/.openclaw/openclaw.json`:
 openclaw gateway restart
 ```
 
-## Standalone Usage
+Done! 🎉
+
+## 飞书应用权限要求
+
+飞书开放平台 → 你的应用 → 权限管理，确保开启：
+
+| 权限 | 说明 | 用途 |
+|------|------|------|
+| `im:resource` | 读取 IM 资源 | 基础权限 |
+| **`im:resource:upload`** | 上传 IM 资源 | ⚠️ **上传语音文件必需** |
+| `im:message:send_as_bot` | 以机器人身份发消息 | 发送语音消息 |
+
+> ⚠️ 没有 `im:resource:upload` 权限会导致语音上传失败！
+
+## 工作模式
+
+### 模式 A: OpenClaw 集成（推荐）
+
+配好 `openclaw.json` 后，OpenClaw 网关自动处理：
+1. AI 回复 ≤ maxTextLength 字 → 自动调用 TTS
+2. 生成 opus 文件 + 获取时长
+3. 网关上传飞书 + 发送语音气泡
+
+你什么都不用管。
+
+### 模式 B: 独立调用
+
+不依赖 OpenClaw，直接通过 stdin 调用：
 
 ```bash
-echo '{"text":"你好","config":{"apiKey":"xxx"}}' | node bin/stepfun-tts
-# {"audioPath":"/tmp/openclaw/tts/stepfun-xxx.opus","format":"opus","duration":2}
+# 仅生成音频
+echo '{"text":"你好世界"}' | STEPFUN_API_KEY=xxx node bin/stepfun-tts
+# → {"audioPath":"/tmp/.../stepfun-xxx.opus","format":"opus","duration":2}
+
+# 生成 + 直接发飞书
+echo '{
+  "text": "你好世界",
+  "feishu": {
+    "chatId": "oc_xxx",
+    "appId": "cli_xxx",
+    "appSecret": "xxx"
+  }
+}' | STEPFUN_API_KEY=xxx node bin/stepfun-tts
+# → {"audioPath":"...","format":"opus","duration":2,"feishu":{"file_key":"file_xxx","message_id":"om_xxx"}}
 ```
 
-**Force MP3 output** (skip Opus conversion):
-```bash
-echo '{"text":"hello","config":{"apiKey":"xxx","format":"mp3"}}' | node bin/stepfun-tts
-```
+## 配置参考
 
-## Environment Variables
+### 环境变量
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `STEPFUN_API_KEY` | ✅ | — | StepFun API key |
-| `STEPFUN_BASE_URL` | ❌ | `https://api.stepfun.com/v1` | API base URL |
-| `STEPFUN_TTS_MODEL` | ❌ | `step-tts-2` | TTS model |
-| `STEPFUN_TTS_VOICE` | ❌ | `yuanqishaonv` | Default voice |
-| `STEPFUN_TTS_FORMAT` | ❌ | `opus` | Output format: `opus` or `mp3` |
-| `STEPFUN_TIMEOUT_MS` | ❌ | `30000` | Request timeout (ms) |
-| `OPENCLAW_TTS_OUT_DIR` | ❌ | `/tmp/openclaw/tts` | Output directory |
+| 变量 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `STEPFUN_API_KEY` | ✅ | — | StepFun API 密钥 |
+| `STEPFUN_BASE_URL` | ❌ | `https://api.stepfun.com/v1` | API 地址 |
+| `STEPFUN_TTS_MODEL` | ❌ | `step-tts-2` | TTS 模型 |
+| `STEPFUN_TTS_VOICE` | ❌ | `yuanqishaonv` | 默认音色 |
+| `STEPFUN_TTS_FORMAT` | ❌ | `opus` | 输出格式 opus/mp3 |
+| `STEPFUN_TIMEOUT_MS` | ❌ | `30000` | 超时毫秒 |
+| `FFMPEG_PATH` | ❌ | 自动查找 | ffmpeg 二进制路径 |
+| `FEISHU_APP_ID` | ❌ | — | 独立模式用 |
+| `FEISHU_APP_SECRET` | ❌ | — | 独立模式用 |
 
-## Available Voices
+### 可用音色
 
-| Voice ID | Description |
-|----------|-------------|
-| `yuanqishaonv` | 元气少女 |
-| `zhishidanv` | 知识大女 |
-| `wenrounvsheng` | 温柔女声 |
-| `chengshunansheng` | 成熟男声 |
-| `huoponvhai` | 活泼女孩 |
+| Voice ID | 描述 |
+|----------|------|
+| `yuanqishaonv` | 元气少女 🎀 |
+| `zhishidanv` | 知识女声 📚 |
+| `wenrounvsheng` | 温柔女声 🌸 |
+| `chengshunansheng` | 成熟男声 🎩 |
+| `huoponvhai` | 活泼女孩 ✨ |
 
-## Handler Protocol
+> 完整列表见 [StepFun 文档](https://platform.stepfun.com/)
 
-**Input** (stdin JSON):
-```json
-{ "text": "你好", "config": { "format": "opus" } }
-```
+## 依赖
 
-**Output** (stdout JSON):
-```json
-{ "audioPath": "/tmp/.../stepfun-xxx.opus", "format": "opus", "duration": 2 }
-```
+- **Node.js** ≥ 16
+- **ffmpeg**（Opus 转换 + 时长检测）
+  ```bash
+  # macOS
+  brew install ffmpeg
+  # Ubuntu
+  sudo apt install ffmpeg
+  # 或 npm
+  npm install -g ffmpeg-static
+  ```
 
-**Error**: exit(1), message on stderr.
+## 常见问题
+
+**Q: 语音和文字同时回复了？**
+A: 这是 AI 行为问题，不是 skill 问题。AI 调用 `tts()` 后应回复 `NO_REPLY` 避免重复。
+
+**Q: 上传飞书报权限错误？**
+A: 确保飞书应用开启了 `im:resource:upload` 权限，并重新发布版本。
+
+**Q: ffmpeg 找不到？**
+A: 设置 `FFMPEG_PATH` 环境变量指向 ffmpeg 二进制文件完整路径。
+
+**Q: 没有 ffmpeg 能用吗？**
+A: 可以，会降级为 MP3 输出，但飞书语音气泡要求 Opus 格式，所以不装 ffmpeg 的话语音消息无法正常显示。
 
 ## License
 

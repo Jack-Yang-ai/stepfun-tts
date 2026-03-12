@@ -3,21 +3,12 @@
 /**
  * StepFun TTS Provider for OpenClaw
  *
- * End-to-end pipeline for Feishu voice messages:
+ * Text → StepFun API (response_format: opus) → Opus file + duration
  *
- *   Text → StepFun API → MP3 → ffmpeg → Opus → duration
- *          ↓
- *   { audioPath, format: "opus", duration: N }
+ * Zero external dependencies. No ffmpeg needed.
  *
- * OpenClaw gateway handles the rest:
- *   Opus file → Feishu upload (im:resource) → voice message
- *
- * Standalone mode (--feishu flag):
- *   Also uploads to Feishu and sends voice message directly.
- *   Requires FEISHU_APP_ID, FEISHU_APP_SECRET env vars.
- *
- * Input:  { text, config?, feishu?: { chatId, appId?, appSecret? } }
- * Output: { audioPath, format, duration, feishu?: { file_key, message_id } }
+ * Input:  { text, config? }
+ * Output: { audioPath, format, duration }
  */
 
 const fs = require('fs');
@@ -25,160 +16,103 @@ const path = require('path');
 const https = require('https');
 const { execSync } = require('child_process');
 
-// ─── Defaults ───────────────────────────────────────────────────
 const defaults = {
   apiKey: process.env.STEPFUN_API_KEY || '',
   baseUrl: process.env.STEPFUN_BASE_URL || 'https://api.stepfun.com/v1',
   model: process.env.STEPFUN_TTS_MODEL || 'step-tts-2',
   voice: process.env.STEPFUN_TTS_VOICE || 'yuanqishaonv',
-  timeoutMs: parseInt(process.env.STEPFUN_TIMEOUT_MS || '30000', 10),
   format: process.env.STEPFUN_TTS_FORMAT || 'opus',
+  timeoutMs: parseInt(process.env.STEPFUN_TIMEOUT_MS || '30000', 10),
 };
 
-// ─── ffmpeg discovery ───────────────────────────────────────────
-function findFfmpeg() {
-  if (process.env.FFMPEG_PATH && fs.existsSync(process.env.FFMPEG_PATH)) {
-    return process.env.FFMPEG_PATH;
-  }
-  try {
-    const p = require('ffmpeg-static');
-    if (p && fs.existsSync(p)) return p;
-  } catch {}
-  try {
-    return execSync('which ffmpeg 2>/dev/null', { encoding: 'utf8' }).trim() || null;
-  } catch {}
-  return null;
-}
-
-const FFMPEG = findFfmpeg();
-
-// ─── HTTP helper ────────────────────────────────────────────────
-function httpRequest(url, options, body) {
+// ─── StepFun TTS API ────────────────────────────────────────────
+function callAPI(text, ov = {}) {
   return new Promise((resolve, reject) => {
-    const u = new URL(url);
+    const apiKey = ov.apiKey || defaults.apiKey;
+    if (!apiKey) { reject(new Error('STEPFUN_API_KEY not set')); return; }
+
+    const fmt = ov.format || defaults.format;
+    const payload = JSON.stringify({
+      model: ov.model || defaults.model,
+      voice: ov.voice || defaults.voice,
+      input: text,
+      response_format: fmt,
+    });
+
+    const baseUrl = (ov.baseUrl || defaults.baseUrl).replace(/\/+$/, '');
+    const url = new URL(`${baseUrl}/audio/speech`);
+
     const req = https.request({
-      hostname: u.hostname,
-      port: u.port || 443,
-      path: u.pathname + u.search,
-      ...options,
+      hostname: url.hostname,
+      port: url.port || 443,
+      path: url.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Length': Buffer.byteLength(payload),
+      },
+      timeout: ov.timeoutMs || defaults.timeoutMs,
     }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`HTTP ${res.statusCode}: ${Buffer.concat(chunks).toString('utf8').slice(0, 300)}`));
+          return;
+        }
+        resolve(Buffer.concat(chunks));
+      });
     });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
-    if (body) req.write(body);
+    req.on('error', (e) => reject(new Error(`Request failed: ${e.message}`)));
+    req.on('timeout', () => { req.destroy(); reject(new Error('Request timed out')); });
+    req.write(payload);
     req.end();
   });
 }
 
-// ─── StepFun TTS API ────────────────────────────────────────────
-async function callTTS(text, ov = {}) {
-  const apiKey = ov.apiKey || defaults.apiKey;
-  if (!apiKey) throw new Error('STEPFUN_API_KEY not set');
-
-  const baseUrl = (ov.baseUrl || defaults.baseUrl).replace(/\/+$/, '');
-  const payload = JSON.stringify({
-    model: ov.model || defaults.model,
-    voice: ov.voice || defaults.voice,
-    input: text,
-  });
-
-  const res = await httpRequest(`${baseUrl}/audio/speech`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Length': Buffer.byteLength(payload),
-    },
-    timeout: ov.timeoutMs || defaults.timeoutMs,
-  }, payload);
-
-  if (res.status !== 200) throw new Error(`StepFun HTTP ${res.status}: ${res.body.toString('utf8').slice(0, 300)}`);
-  return res.body;
-}
-
-// ─── Audio conversion ───────────────────────────────────────────
-function toOpus(mp3, opus) {
-  if (!FFMPEG) throw new Error('ffmpeg not found. Set FFMPEG_PATH or: brew install ffmpeg');
-  execSync(`"${FFMPEG}" -y -i "${mp3}" -c:a libopus -b:a 32k -ar 48000 -ac 1 "${opus}" 2>/dev/null`, { stdio: 'pipe' });
-}
-
-function getDuration(file) {
-  if (!FFMPEG) return 0;
+// ─── Opus duration (parse Ogg headers, no ffmpeg) ───────────────
+function getOpusDuration(buf) {
+  // Ogg Opus: find sample rate from OpusHead, then count granule positions
+  // Fast method: find last Ogg page's granule position
   try {
-    const out = execSync(`"${FFMPEG}" -i "${file}" -f null - 2>&1 | grep "time=" | tail -1`, {
-      encoding: 'utf8', shell: true,
+    // OpusHead: sample rate at bytes 12-15 (little-endian)
+    let sampleRate = 48000; // Opus default
+    for (let i = 0; i < buf.length - 4; i++) {
+      if (buf[i] === 0x4F && buf[i+1] === 0x67 && buf[i+2] === 0x67 && buf[i+3] === 0x53) {
+        // OggS page found — granule position at offset +6 (8 bytes, LE)
+        // We want the LAST page's granule
+      }
+    }
+    // Simpler: use last OggS page granule position
+    let lastGranule = 0n;
+    let pos = buf.length - 4;
+    while (pos >= 0) {
+      if (buf[pos] === 0x4F && buf[pos+1] === 0x67 && buf[pos+2] === 0x67 && buf[pos+3] === 0x53) {
+        // granule position: 8 bytes at offset 6
+        lastGranule = buf.readBigUInt64LE(pos + 6);
+        break;
+      }
+      pos--;
+    }
+    if (lastGranule > 0n) {
+      return Math.ceil(Number(lastGranule) / sampleRate);
+    }
+  } catch {}
+  // Fallback: try ffmpeg/ffprobe if available
+  return 0;
+}
+
+function getDurationFfmpeg(file) {
+  try {
+    const ffmpeg = process.env.FFMPEG_PATH || 'ffmpeg';
+    const out = execSync(`"${ffmpeg}" -i "${file}" -f null - 2>&1 | grep "time=" | tail -1`, {
+      encoding: 'utf8', shell: true, timeout: 5000,
     });
     const m = out.match(/time=(\d+):(\d+):([\d.]+)/);
-    if (!m) return 0;
-    return Math.ceil(+m[1] * 3600 + +m[2] * 60 + parseFloat(m[3]));
-  } catch { return 0; }
-}
-
-// ─── Feishu API (standalone mode) ───────────────────────────────
-async function getFeishuToken(appId, appSecret) {
-  const payload = JSON.stringify({ app_id: appId, app_secret: appSecret });
-  const res = await httpRequest('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
-  }, payload);
-  const data = JSON.parse(res.body.toString('utf8'));
-  if (data.code !== 0) throw new Error(`Feishu auth failed: ${data.msg}`);
-  return data.tenant_access_token;
-}
-
-async function uploadToFeishu(token, opusPath, duration) {
-  const boundary = '----FormBoundary' + Math.random().toString(36).slice(2);
-  const fileData = fs.readFileSync(opusPath);
-  const fileName = path.basename(opusPath);
-
-  const parts = [];
-  // file_type
-  parts.push(`--${boundary}\r\nContent-Disposition: form-data; name="file_type"\r\n\r\nopus`);
-  // duration
-  parts.push(`--${boundary}\r\nContent-Disposition: form-data; name="duration"\r\n\r\n${duration}`);
-  // file_name
-  parts.push(`--${boundary}\r\nContent-Disposition: form-data; name="file_name"\r\n\r\n${fileName}`);
-  // file
-  parts.push(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: audio/ogg\r\n\r\n`);
-
-  const head = Buffer.from(parts.join('\r\n') + '\r\n', 'utf8');
-  const tail = Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8');
-  const body = Buffer.concat([head, fileData, tail]);
-
-  const res = await httpRequest('https://open.feishu.cn/open-apis/im/v1/files', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': `multipart/form-data; boundary=${boundary}`,
-      'Content-Length': body.length,
-    },
-  }, body);
-
-  const data = JSON.parse(res.body.toString('utf8'));
-  if (data.code !== 0) throw new Error(`Feishu upload failed: ${data.msg}`);
-  return data.data.file_key;
-}
-
-async function sendVoiceMessage(token, chatId, fileKey) {
-  const payload = JSON.stringify({
-    receive_id: chatId,
-    msg_type: 'audio',
-    content: JSON.stringify({ file_key: fileKey }),
-  });
-  const res = await httpRequest('https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(payload),
-    },
-  }, payload);
-  const data = JSON.parse(res.body.toString('utf8'));
-  if (data.code !== 0) throw new Error(`Feishu send failed: ${data.msg}`);
-  return data.data.message_id;
+    if (m) return Math.ceil(+m[1] * 3600 + +m[2] * 60 + parseFloat(m[3]));
+  } catch {}
+  return 0;
 }
 
 // ─── Main ───────────────────────────────────────────────────────
@@ -188,50 +122,31 @@ async function sendVoiceMessage(token, chatId, fileKey) {
   process.stdin.on('data', (c) => (raw += c));
   process.stdin.on('end', async () => {
     try {
-      const { text, config: ov = {}, feishu } = JSON.parse(raw);
+      const { text, config: ov = {} } = JSON.parse(raw);
       if (!text || typeof text !== 'string') throw new Error('Missing "text"');
 
       const fmt = ov.format || defaults.format;
+      const ext = fmt === 'opus' ? '.opus' : fmt === 'wav' ? '.wav' : `.${fmt}`;
+
+      // Call API with response_format directly — no conversion needed
+      const buf = await callAPI(text, ov);
+
       const outDir = process.env.OPENCLAW_TTS_OUT_DIR || '/tmp/openclaw/tts';
       fs.mkdirSync(outDir, { recursive: true });
       const tag = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const outPath = path.join(outDir, `stepfun-${tag}${ext}`);
+      fs.writeFileSync(outPath, buf);
 
-      // Step 1: StepFun API → MP3
-      const buf = await callTTS(text, ov);
-      const mp3 = path.join(outDir, `stepfun-${tag}.mp3`);
-      fs.writeFileSync(mp3, buf);
-
-      let audioPath = mp3;
-      let format = 'mp3';
+      // Get duration
       let duration = 0;
-
-      if (fmt === 'opus' && FFMPEG) {
-        // Step 2: MP3 → Opus
-        const opus = path.join(outDir, `stepfun-${tag}.opus`);
-        toOpus(mp3, opus);
-        duration = getDuration(opus);
-        try { fs.unlinkSync(mp3); } catch {}
-        audioPath = opus;
-        format = 'opus';
-      } else {
-        duration = getDuration(mp3);
+      if (fmt === 'opus') {
+        duration = getOpusDuration(buf);
+      }
+      if (duration === 0) {
+        duration = getDurationFfmpeg(outPath);
       }
 
-      const result = { audioPath, format, duration };
-
-      // Step 3 (optional): Upload to Feishu + send voice message
-      if (feishu && feishu.chatId) {
-        const appId = feishu.appId || process.env.FEISHU_APP_ID;
-        const appSecret = feishu.appSecret || process.env.FEISHU_APP_SECRET;
-        if (!appId || !appSecret) throw new Error('FEISHU_APP_ID and FEISHU_APP_SECRET required for Feishu mode');
-
-        const token = await getFeishuToken(appId, appSecret);
-        const fileKey = await uploadToFeishu(token, audioPath, duration);
-        const msgId = await sendVoiceMessage(token, feishu.chatId, fileKey);
-        result.feishu = { file_key: fileKey, message_id: msgId };
-      }
-
-      process.stdout.write(JSON.stringify(result) + '\n');
+      process.stdout.write(JSON.stringify({ audioPath: outPath, format: fmt, duration }) + '\n');
     } catch (e) {
       process.stderr.write(e.message + '\n');
       process.exit(1);

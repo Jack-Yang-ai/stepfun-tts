@@ -1,38 +1,44 @@
 # stepfun-tts
 
-🔊 StepFun Step-TTS-2 text-to-speech skill for [OpenClaw](https://github.com/openclaw/openclaw).
+🔊 StepFun Step-TTS-2 text-to-speech for [OpenClaw](https://github.com/openclaw/openclaw).
 
-One-stop solution: **text → speech → 飞书语音气泡**
+**Zero dependencies** — no ffmpeg, no npm packages. Just Node.js.
 
-## Features
+## How it works
 
-- 🇨🇳 High-quality Chinese TTS (Step-TTS-2)
-- 🔄 Auto MP3 → Opus conversion (ffmpeg)
-- ⏱ Duration detection for Feishu voice messages
-- 📱 Feishu voice bubble support (`im:resource:upload`)
-- 🔌 OpenClaw integration OR standalone mode
-- 📦 Zero npm dependencies
-
-## Quick Start
-
-```bash
-# 1. Install
-git clone https://github.com/Jack-Yang-ai/stepfun-tts.git ~/.openclaw/skills/stepfun-tts
-
-# 2. Set API key
-export STEPFUN_API_KEY="your-key"
-
-# 3. Configure OpenClaw (see SKILL.md)
-# 4. openclaw gateway restart
+```
+Text → StepFun API (response_format: opus) → Opus + Duration → Voice bubble
 ```
 
-## Feishu Permissions Required
+StepFun API natively outputs Opus. No conversion needed.
+Duration parsed from Ogg headers in pure JS.
 
-| Permission | Description |
+## Install
+
+```bash
+git clone https://github.com/Jack-Yang-ai/stepfun-tts.git ~/.openclaw/skills/stepfun-tts
+chmod +x ~/.openclaw/skills/stepfun-tts/bin/stepfun-tts
+export STEPFUN_API_KEY="your-key"
+# Configure openclaw.json (see SKILL.md) → openclaw gateway restart
+```
+
+## Cross-platform
+
+Works with all OpenClaw channels:
+
+| Platform | Voice bubble |
+|----------|-------------|
+| Feishu | ✅ |
+| Telegram | ✅ |
+| Discord | ✅ |
+| WhatsApp | ✅ |
+
+## Feishu permissions
+
+| Permission | Required for |
 |------------|-------------|
-| `im:resource` | Read IM resources |
-| **`im:resource:upload`** | **Upload IM resources (voice files)** |
-| `im:message:send_as_bot` | Send messages as bot |
+| `im:resource:upload` | Upload voice files |
+| `im:message:send_as_bot` | Send voice messages |
 
 ## Voices
 
@@ -42,13 +48,7 @@ export STEPFUN_API_KEY="your-key"
 | `wenrounvsheng` | 温柔女声 🌸 |
 | `chengshunansheng` | 成熟男声 🎩 |
 
-## Pipeline
-
-```
-Text → StepFun API → MP3 → ffmpeg → Opus → Feishu Upload → Voice Bubble
-```
-
-See [SKILL.md](SKILL.md) for full documentation.
+See [SKILL.md](SKILL.md) for full docs.
 
 ## License
 

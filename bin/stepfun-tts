@@ -3,17 +3,20 @@
 /**
  * StepFun TTS Provider Handler for OpenClaw
  *
- * Wraps StepFun's Step-TTS-2 speech API.
- * Reads JSON from stdin, writes result JSON to stdout.
+ * Pipeline:
+ * 1. Call StepFun API → MP3 buffer
+ * 2. ffmpeg: MP3 → Opus (飞书语音气泡要求)
+ * 3. ffmpeg: 读取时长 (duration in seconds)
+ * 4. Output: { audioPath, format, duration }
  *
- * Input:  { text: string, config?: { apiKey?, model?, voice? } }
- * Output: { audioPath: string, format: string }
- * Error:  exit(1) + stderr message
+ * Input:  { text: string, config?: { apiKey?, model?, voice?, format? } }
+ * Output: { audioPath: string, format: string, duration: number }
  */
 
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const { execSync } = require('child_process');
 
 const defaults = {
   apiKey: process.env.STEPFUN_API_KEY || '',
@@ -21,21 +24,35 @@ const defaults = {
   model: process.env.STEPFUN_TTS_MODEL || 'step-tts-2',
   voice: process.env.STEPFUN_TTS_VOICE || 'yuanqishaonv',
   timeoutMs: parseInt(process.env.STEPFUN_TIMEOUT_MS || '30000', 10),
+  format: process.env.STEPFUN_TTS_FORMAT || 'opus',
 };
 
-/**
- * Generate audio from text via StepFun TTS API.
- * @param {string} text - Text to synthesize
- * @param {object} overrides - Optional config overrides
- * @returns {Promise<{audioPath: string, format: string}>}
- */
-function generateAudio(text, overrides = {}) {
+// ─── ffmpeg discovery ───────────────────────────────────────────
+function findFfmpeg() {
+  // Priority: env > ffmpeg-static > PATH
+  if (process.env.FFMPEG_PATH && fs.existsSync(process.env.FFMPEG_PATH)) {
+    return process.env.FFMPEG_PATH;
+  }
+  // Try ffmpeg-static (npm)
+  try {
+    const staticPath = require('ffmpeg-static');
+    if (staticPath && fs.existsSync(staticPath)) return staticPath;
+  } catch {}
+  // Try PATH
+  try {
+    const p = execSync('which ffmpeg 2>/dev/null || where ffmpeg 2>nul', { encoding: 'utf8' }).trim();
+    if (p) return p;
+  } catch {}
+  return null;
+}
+
+const FFMPEG = findFfmpeg();
+
+// ─── StepFun API ────────────────────────────────────────────────
+function callAPI(text, overrides = {}) {
   return new Promise((resolve, reject) => {
     const apiKey = overrides.apiKey || defaults.apiKey;
-    if (!apiKey) {
-      reject(new Error('STEPFUN_API_KEY not set. Export it or pass via config.apiKey'));
-      return;
-    }
+    if (!apiKey) { reject(new Error('STEPFUN_API_KEY not set')); return; }
 
     const payload = JSON.stringify({
       model: overrides.model || defaults.model,
@@ -43,73 +60,90 @@ function generateAudio(text, overrides = {}) {
       input: text,
     });
 
-    const baseUrl = overrides.baseUrl || defaults.baseUrl;
-    const url = new URL('/audio/speech', baseUrl);
+    const baseUrl = (overrides.baseUrl || defaults.baseUrl).replace(/\/+$/, '');
+    const url = new URL(`${baseUrl}/audio/speech`);
 
-    const options = {
+    const req = https.request({
       hostname: url.hostname,
       port: url.port || 443,
       path: url.pathname,
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
+        Authorization: `Bearer ${apiKey}`,
         'Content-Length': Buffer.byteLength(payload),
       },
       timeout: overrides.timeoutMs || defaults.timeoutMs,
-    };
-
-    const req = https.request(options, (res) => {
+    }, (res) => {
       const chunks = [];
-      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('data', (c) => chunks.push(c));
       res.on('end', () => {
         if (res.statusCode !== 200) {
-          const body = Buffer.concat(chunks).toString('utf8');
-          reject(new Error(`StepFun TTS HTTP ${res.statusCode}: ${body.slice(0, 500)}`));
+          reject(new Error(`HTTP ${res.statusCode}: ${Buffer.concat(chunks).toString('utf8').slice(0, 300)}`));
           return;
         }
-
-        const outDir = process.env.OPENCLAW_TTS_OUT_DIR || '/tmp/openclaw/tts';
-        fs.mkdirSync(outDir, { recursive: true });
-
-        const ts = Date.now();
-        const rand = Math.random().toString(36).slice(2, 8);
-        const outPath = path.join(outDir, `stepfun-${ts}-${rand}.mp3`);
-
-        fs.writeFileSync(outPath, Buffer.concat(chunks));
-        resolve({ audioPath: outPath, format: 'mp3' });
+        resolve(Buffer.concat(chunks));
       });
     });
-
-    req.on('error', (err) => reject(new Error(`StepFun TTS request failed: ${err.message}`)));
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new Error('StepFun TTS request timed out'));
-    });
-
+    req.on('error', (e) => reject(new Error(`Request failed: ${e.message}`)));
+    req.on('timeout', () => { req.destroy(); reject(new Error('Request timed out')); });
     req.write(payload);
     req.end();
   });
 }
 
-// Main: read stdin JSON, produce output
+// ─── Audio helpers ──────────────────────────────────────────────
+function toOpus(mp3, opus) {
+  if (!FFMPEG) throw new Error('ffmpeg not found. Set FFMPEG_PATH or install ffmpeg.');
+  execSync(`"${FFMPEG}" -y -i "${mp3}" -c:a libopus -b:a 32k -ar 48000 -ac 1 "${opus}" 2>/dev/null`, { stdio: 'pipe' });
+}
+
+function getDuration(file) {
+  if (!FFMPEG) return 0;
+  try {
+    const out = execSync(`"${FFMPEG}" -i "${file}" -f null - 2>&1 | grep "time=" | tail -1`, {
+      encoding: 'utf8', shell: true,
+    });
+    const m = out.match(/time=(\d+):(\d+):([\d.]+)/);
+    if (!m) return 0;
+    return Math.ceil(parseInt(m[1]) * 3600 + parseInt(m[2]) * 60 + parseFloat(m[3]));
+  } catch { return 0; }
+}
+
+// ─── Main ───────────────────────────────────────────────────────
 (async () => {
   let raw = '';
-
   process.stdin.setEncoding('utf8');
-  process.stdin.on('data', (chunk) => (raw += chunk));
+  process.stdin.on('data', (c) => (raw += c));
   process.stdin.on('end', async () => {
     try {
-      const input = JSON.parse(raw);
-      const text = input.text;
-      if (!text || typeof text !== 'string') {
-        throw new Error('Missing or invalid "text" field');
-      }
+      const { text, config: ov = {} } = JSON.parse(raw);
+      if (!text || typeof text !== 'string') throw new Error('Missing "text"');
 
-      const result = await generateAudio(text, input.config || {});
-      process.stdout.write(JSON.stringify(result) + '\n');
-    } catch (err) {
-      process.stderr.write(err.message + '\n');
+      const fmt = ov.format || defaults.format;
+      const outDir = process.env.OPENCLAW_TTS_OUT_DIR || '/tmp/openclaw/tts';
+      fs.mkdirSync(outDir, { recursive: true });
+
+      const tag = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+      // Step 1: API → MP3
+      const buf = await callAPI(text, ov);
+      const mp3 = path.join(outDir, `stepfun-${tag}.mp3`);
+      fs.writeFileSync(mp3, buf);
+
+      if (fmt === 'opus' && FFMPEG) {
+        // Step 2: MP3 → Opus
+        const opus = path.join(outDir, `stepfun-${tag}.opus`);
+        toOpus(mp3, opus);
+        const dur = getDuration(opus);
+        try { fs.unlinkSync(mp3); } catch {}
+        process.stdout.write(JSON.stringify({ audioPath: opus, format: 'opus', duration: dur }) + '\n');
+      } else {
+        const dur = getDuration(mp3);
+        process.stdout.write(JSON.stringify({ audioPath: mp3, format: 'mp3', duration: dur }) + '\n');
+      }
+    } catch (e) {
+      process.stderr.write(e.message + '\n');
       process.exit(1);
     }
   });

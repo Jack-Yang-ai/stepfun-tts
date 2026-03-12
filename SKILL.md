@@ -1,47 +1,71 @@
 ---
 name: stepfun-tts
-description: StepFun Step-TTS-2 text-to-speech integration for OpenClaw. Converts text to natural Chinese/English speech via StepFun's TTS API.
-version: 0.1.0
+description: StepFun Step-TTS-2 text-to-speech for OpenClaw. MP3 → Opus conversion + duration detection for Feishu voice bubbles.
+version: 0.2.0
 author: "marine"
 tags:
   - tts
   - stepfun
   - speech
   - chinese
-  - audio
+  - feishu
+  - opus
 metadata:
   openclaw:
     emoji: "🔊"
     os: ["darwin", "linux", "win32"]
     requires:
       env: ["STEPFUN_API_KEY"]
+      bin: ["ffmpeg", "ffprobe"]
 ---
 
 # StepFun TTS for OpenClaw
 
-Integrates [StepFun's Step-TTS-2](https://platform.stepfun.com/) text-to-speech API as an OpenClaw TTS provider. Produces natural-sounding Chinese and English speech.
+Integrates [StepFun's Step-TTS-2](https://platform.stepfun.com/) text-to-speech API as an OpenClaw TTS provider.
+
+## Pipeline
+
+```
+Text → StepFun API → MP3 → ffmpeg → Opus → ffprobe → duration
+                                      ↓
+                              { audioPath, format: "opus", duration: 3 }
+```
+
+**Why Opus?** 飞书语音消息要求 Opus 格式 + 时长（秒）。本 skill 自动完成转换。
 
 ## Features
 
 - 🇨🇳 High-quality Chinese TTS (multiple voices)
-- 🔄 OpenAI-compatible API format
-- ⚡ Fast generation (typically < 2s for short text)
-- 🔒 API key via environment variable (no hardcoding)
-- 📦 Zero external dependencies (Node.js built-ins only)
+- 🔄 Auto MP3→Opus conversion via ffmpeg
+- ⏱ Duration detection via ffprobe (integer seconds)
+- 📱 飞书语音气泡完整支持 (file_type=opus + duration)
+- 🔒 API key via environment variable
+- 📦 Zero npm dependencies (Node.js built-ins + system ffmpeg)
 
 ## Quick Start
 
-### 1. Get your API key
-
-Sign up at [StepFun Platform](https://platform.stepfun.com/) and create an API key.
-
-### 2. Set environment variable
+### Prerequisites
 
 ```bash
-export STEPFUN_API_KEY="your-api-key-here"
+# macOS
+brew install ffmpeg
+
+# Ubuntu/Debian
+sudo apt install ffmpeg
 ```
 
-### 3. Configure OpenClaw
+### Install
+
+```bash
+clawhub install stepfun-tts
+# or copy to ~/.openclaw/skills/stepfun-tts/
+```
+
+### Configure
+
+```bash
+export STEPFUN_API_KEY="your-api-key"
+```
 
 Add to `~/.openclaw/openclaw.json`:
 
@@ -62,90 +86,57 @@ Add to `~/.openclaw/openclaw.json`:
 }
 ```
 
-> **Note:** StepFun's TTS API is OpenAI-compatible, so we use the `openai` provider with StepFun's base URL configured via the handler.
-
-### 4. Restart gateway
-
 ```bash
 openclaw gateway restart
 ```
 
 ## Standalone Usage
 
-The handler can also be used standalone:
-
 ```bash
-echo '{"text": "你好世界", "config": {"apiKey": "your-key"}}' | node bin/stepfun-tts
-# Output: {"audioPath": "/tmp/openclaw/tts/stepfun-xxx.mp3", "format": "mp3"}
+echo '{"text":"你好","config":{"apiKey":"xxx"}}' | node bin/stepfun-tts
+# {"audioPath":"/tmp/openclaw/tts/stepfun-xxx.opus","format":"opus","duration":2}
 ```
 
-Or via curl directly:
-
+**Force MP3 output** (skip Opus conversion):
 ```bash
-curl -sS 'https://api.stepfun.com/v1/audio/speech' \
-  -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer $STEPFUN_API_KEY" \
-  -d '{"model":"step-tts-2","voice":"yuanqishaonv","input":"你好世界"}' \
-  --output output.mp3
+echo '{"text":"hello","config":{"apiKey":"xxx","format":"mp3"}}' | node bin/stepfun-tts
 ```
 
-## Configuration
-
-### Environment Variables
+## Environment Variables
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `STEPFUN_API_KEY` | ✅ | — | StepFun API key |
 | `STEPFUN_BASE_URL` | ❌ | `https://api.stepfun.com/v1` | API base URL |
-| `STEPFUN_TTS_MODEL` | ❌ | `step-tts-2` | TTS model name |
-| `STEPFUN_TTS_VOICE` | ❌ | `yuanqishaonv` | Default voice ID |
+| `STEPFUN_TTS_MODEL` | ❌ | `step-tts-2` | TTS model |
+| `STEPFUN_TTS_VOICE` | ❌ | `yuanqishaonv` | Default voice |
+| `STEPFUN_TTS_FORMAT` | ❌ | `opus` | Output format: `opus` or `mp3` |
 | `STEPFUN_TIMEOUT_MS` | ❌ | `30000` | Request timeout (ms) |
-| `OPENCLAW_TTS_OUT_DIR` | ❌ | `/tmp/openclaw/tts` | Audio output directory |
+| `OPENCLAW_TTS_OUT_DIR` | ❌ | `/tmp/openclaw/tts` | Output directory |
 
-### Available Voices
+## Available Voices
 
 | Voice ID | Description |
 |----------|-------------|
-| `yuanqishaonv` | 元气少女 (Energetic girl) |
-| `zhishidanv` | 知识大女 (Knowledgeable woman) |
-| `wenrounvsheng` | 温柔女声 (Gentle female) |
-| `chengshunansheng` | 成熟男声 (Mature male) |
-| `huoponvhai` | 活泼女孩 (Lively girl) |
-
-> Check StepFun's documentation for the latest voice list.
+| `yuanqishaonv` | 元气少女 |
+| `zhishidanv` | 知识大女 |
+| `wenrounvsheng` | 温柔女声 |
+| `chengshunansheng` | 成熟男声 |
+| `huoponvhai` | 活泼女孩 |
 
 ## Handler Protocol
 
-The handler follows the OpenClaw TTS provider contract:
-
 **Input** (stdin JSON):
 ```json
-{
-  "text": "Hello world",
-  "config": {
-    "apiKey": "optional-override",
-    "model": "step-tts-2",
-    "voice": "yuanqishaonv"
-  }
-}
+{ "text": "你好", "config": { "format": "opus" } }
 ```
 
 **Output** (stdout JSON):
 ```json
-{
-  "audioPath": "/tmp/openclaw/tts/stepfun-1234567890-abc123.mp3",
-  "format": "mp3"
-}
+{ "audioPath": "/tmp/.../stepfun-xxx.opus", "format": "opus", "duration": 2 }
 ```
 
-**Error**: Exit code 1, error message on stderr.
-
-## Security
-
-- API key read from `STEPFUN_API_KEY` env var or stdin config — never hardcoded
-- No API key logging
-- Temp files in `/tmp/openclaw/tts/` — cleaned by OS
-- HTTPS only with Node.js default certificate validation
+**Error**: exit(1), message on stderr.
 
 ## License
 
